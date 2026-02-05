@@ -1,173 +1,172 @@
-import base64
+import time
 import os
 import io
-from PIL import Image  # 이미지를 다루기 위한 도구
 from playwright.sync_api import sync_playwright
+from PIL import Image
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# ==========================================
-# 1. 설정 (Gemini 설정)
-# ==========================================
+# 1. 환경 변수 로드 (API 키)
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    print("🚨 에러: .env 파일에서 GEMINI_API_KEY를 찾을 수 없습니다.")
-    exit()
-
-# 구글 Gemini 설정
-genai.configure(api_key=api_key)
-# 가장 가볍고 빠른 'Gemini 1.5 Flash' 모델 사용
-model = genai.GenerativeModel('gemini-2.5-flash')
+if not GENAI_API_KEY:
+    print("❌ 오류: .env 파일에서 GEMINI_API_KEY를 찾을 수 없습니다.")
+else:
+    genai.configure(api_key=GENAI_API_KEY)
 
 # ==========================================
-# 2. 크롬(디버깅 모드)에서 이미지 가져오기 (풀 스크롤 버전)
+# 1. 디버깅 크롬 연결 & 이미지 캡처 함수
 # ==========================================
-def get_images_from_current_chrome():
-    print("🚀 현재 열려 있는 크롬 브라우저에 접속 시도 중...")
+def get_images_from_current_chrome(target_url=None):
+    print("🕵️ 현재 열려 있는 크롬(디버깅 모드)에 연결을 시도합니다...")
     
     image_data_list = []
 
-    with sync_playwright() as p:
-        try:
-            # 디버깅 모드로 켜진 크롬(9222 포트)에 연결
+    try:
+        with sync_playwright() as p:
+            # 1. 크롬 연결
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
-            
-            # 쿠팡 탭 찾기
             context = browser.contexts[0]
-            target_page = None
             
-            for page in context.pages:
-                if "쿠팡" in page.title() or "Coupang" in page.title():
-                    target_page = page
-                    target_page.bring_to_front()
-                    print(f"✅ 쿠팡 탭 발견: {page.title()}")
-                    break
-            
-            if not target_page:
-                if context.pages:
-                    target_page = context.pages[0]
-                    print(f"⚠️ 쿠팡 탭을 못 찾아서 현재 보고 있는 탭을 사용합니다.")
-                else:
-                    return []
+            # 2. 탭 확보
+            if not context.pages:
+                page = context.new_page()
+            else:
+                page = context.pages[0]
 
-            # ---------------------------------------------------------
-            # [업그레이드] 페이지 끝까지 스크롤 (Infinite Scroll 처리)
-            # ---------------------------------------------------------
-            print("📜 페이지 끝까지 스크롤을 시작합니다... (시간이 좀 걸릴 수 있습니다)")
-            
+            print("✅ 브라우저 연결 성공!")
+
+            # 3. URL 이동 (입력된 경우만)
+            if target_url and len(target_url) > 5:
+                print(f"🚀 입력하신 링크로 이동합니다...")
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                    print("   --> 페이지 이동 완료! (잠시 대기 중)")
+                    page.wait_for_timeout(2000)
+                except Exception as e:
+                    print(f"⚠️ 페이지 이동 중 경고(무시 가능): {e}")
+            else:
+                print("📍 URL 입력이 없어 현재 보고 있는 페이지를 분석합니다.")
+
+            print(f"📄 현재 페이지 제목: {page.title()}")
+
+            # 4. 스크롤 내리기
+            print("📜 페이지 스크롤 시작 (이미지 로딩)...")
             previous_height = 0
             while True:
-                # 현재 높이 가져오기
-                current_height = target_page.evaluate("document.body.scrollHeight")
-                
-                # 스크롤을 맨 아래로 내림
-                target_page.mouse.wheel(0, 5000) 
-                target_page.wait_for_timeout(1000) # 로딩 대기 (1초)
-                
-                # 더 이상 높이가 안 변하면(바닥에 닿았으면) 중단
-                new_height = target_page.evaluate("document.body.scrollHeight")
+                page.mouse.wheel(0, 3000)
+                page.wait_for_timeout(1000)
+                new_height = page.evaluate("document.body.scrollHeight")
                 if new_height == previous_height:
-                    print("   --> 페이지 바닥에 도착했습니다!")
                     break
-                
                 previous_height = new_height
-                print("   ... 읽어들이는 중 ...")
+            
+            print("   --> 스크롤 완료!")
 
-            # ---------------------------------------------------------
-            # 이미지 수집 (제한을 좀 더 풂)
-            # ---------------------------------------------------------
-            # 1. 상세페이지 전체 영역 잡기
+            # 5. 이미지 찾기
             selectors = ["#productDetail img", ".product-detail-content img", ".detail-item img", "img"]
-            found_images = []
+            found_locators = []
             
             for selector in selectors:
-                elements = target_page.locator(selector).all()
-                for img in elements:
+                locators = page.locator(selector).all()
+                for loc in locators:
                     try:
-                        box = img.bounding_box()
-                        # 너비 400px 이상, 높이 100px 이상인 '진짜' 정보성 이미지만
-                        if box and box['width'] > 400 and box['height'] > 100: 
-                            found_images.append(img)
+                        box = loc.bounding_box()
+                        if box and box['width'] > 300 and box['height'] > 100: 
+                            found_locators.append(loc)
                     except: continue
-                
-                # 유효한 이미지를 3장 이상 찾았으면 그 선택자가 정답임
-                if len(found_images) >= 3: break
+                if len(found_locators) >= 3: break
             
-            # 중복 제거 및 최대 15장까지 수집 (영양정보는 보통 뒤에 있으니 뒤쪽 이미지도 중요)
-            # 너무 많으면 Gemini 비용/속도 문제가 있으니 15장 정도로 타협
-            unique_images = found_images[:15] 
-            print(f"🎯 분석 대상 이미지: {len(unique_images)}개 (상세페이지 전체 스캔 완료)")
+            unique_locators = found_locators[:10]
+            print(f"🎯 발견된 유효 이미지: {len(unique_locators)}장")
 
-            for i, img in enumerate(unique_images):
-                src = img.get_attribute("src")
-                if src:
-                    if src.startswith("//"): src = "https:" + src
-                    try:
-                        image_bytes = target_page.request.get(src).body()
-                        pil_image = Image.open(io.BytesIO(image_bytes))
-                        image_data_list.append(pil_image)
-                        print(f"   [+] 이미지 {i+1} 수집 완료")
-                    except Exception as e:
-                        print(f"   [-] 이미지 {i+1} 실패: {e}")
+            # 6. 화면 캡처
+            for i, loc in enumerate(unique_locators):
+                try:
+                    loc.scroll_into_view_if_needed()
+                    page.wait_for_timeout(500)
+                    image_bytes = loc.screenshot()
+                    pil_image = Image.open(io.BytesIO(image_bytes))
+                    image_data_list.append(pil_image)
+                    print(f"   [+] 이미지 {i+1} 캡처 성공")
+                except Exception as e:
+                    print(f"   [-] 이미지 {i+1} 캡처 실패: {e}")
             
-            browser.disconnect()
+            browser.close() 
 
-        except Exception as e:
-            print(f"🚨 연결 실패: {e}")
-            
+    except Exception as e:
+        print(f"\n🚨 연결 또는 실행 실패: {e}")
+        print("💡 [체크리스트]")
+        print("1. 크롬이 다 꺼져 있었나요?")
+        print("2. 디버깅 명령어로 크롬을 켰나요?")
+
     return image_data_list
 
 # ==========================================
-# 3. Gemini 분석 함수
+# 2. Gemini 분석 함수 (이름 통일됨!)
 # ==========================================
-def analyze_nutrition_with_gemini(pil_images):
-    if not pil_images:
-        return "분석할 이미지가 없습니다."
-
-    print("🤖 Gemini 분석 시작...")
+def analyze_images_with_gemini(images):
+    if not images:
+        return "수집된 이미지가 없습니다."
     
-    # 프롬프트 작성
+    print(f"\n🧠 Gemini에게 이미지 {len(images)}장을 보내 분석 중입니다...")
+    
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    
     prompt = """
     당신은 깐깐한 '식품 영양 분석 전문가'입니다. 
-    제공된 이미지들(제품 상세페이지)을 보고 다음 정보를 찾아 정리해주세요.
+    제공된 상품 상세페이지 이미지들을 보고 다음 정보를 찾아 정리해주세요.
     
     **중요: 영양성분표는 보통 이미지의 맨 마지막 부분이나, '상품정보제공고시' 표에 있습니다. 끝까지 꼼꼼히 봐주세요.**
     
     [출력 양식]
     1. 제품명:
-    2. 칼로리:
-    3. 주요 영양성분 (당류, 단백질 등):
-    4. 원재료명:
-    5. 특이사항 (알레르기 유발 성분 등):
-    6. 합성첨가물 유무 및 종류:
-    7. 종합 평가:
-    
-
-    마지막에 웰니스 관점에서 3줄 요약 평가를 해주세요.
+    2. 칼로리 (총 내용량 기준):
+    3. 주요 영양성분 (100g당 또는 1회 제공량당):
+       - 탄수화물:
+       - 당류:
+       - 단백질:
+       - 지방:
+       - 나트륨:
+    4. 원재료명 (주요 성분 위주로):
+    5. 특이사항 (알레르기, 특징 등):
+    6. 웰니스 관점 3줄 평가:
     """
     
+    request_content = [prompt] + images
+    
     try:
-        # 텍스트 프롬프트 + 이미지 리스트를 한 번에 전달
-        response = model.generate_content([prompt, *pil_images])
+        response = model.generate_content(request_content)
         return response.text
     except Exception as e:
-        return f"Gemini 분석 중 에러 발생: {e}"
+        return f"Gemini 분석 중 오류 발생: {e}"
 
 # ==========================================
-# 4. 실행
+# 3. 메인 실행 함수
 # ==========================================
-if __name__ == "__main__":
-    print("⚠️  [주의] 크롬 디버깅 모드가 켜져 있어야 합니다.")
+def main():
+    print("\n" + "="*50)
+    print("🛒 쿠팡 영양성분 분석기 (최종 수정판)")
+    print("="*50)
     
-    images = get_images_from_current_chrome()
+    # 1. URL 입력
+    print("분석할 상품 페이지의 URL을 입력하세요.")
+    print("(입력 없이 엔터 치면, 현재 크롬 화면을 그대로 분석합니다)")
+    input_url = input("🔗 URL 입력: ").strip()
+
+    # 2. 이미지 수집
+    images = get_images_from_current_chrome(input_url)
     
+    # 3. 분석 (함수 이름 이제 맞음!)
     if images:
-        result = analyze_nutrition_with_gemini(images)
+        result = analyze_images_with_gemini(images)
         print("\n" + "="*50)
-        print("💎 Gemini 분석 결과")
+        print("📊 [분석 결과]")
         print("="*50)
         print(result)
     else:
-        print("이미지를 가져오지 못했습니다.")
+        print("\n❌ 분석할 이미지를 찾지 못했습니다.")
+
+if __name__ == "__main__":
+    main()
